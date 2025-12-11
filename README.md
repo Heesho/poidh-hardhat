@@ -24,19 +24,19 @@ Poidh allows users to create bounties for tasks or requests. Workers submit clai
 ## State Machine
 
 ```
-                    ┌─────────────────────────────────────┐
-                    │                                     │
-                    ▼                                     │
-┌──────┐  cancel  ┌───────────┐  startVote  ┌─────────┐  │ vote fails
-│ OPEN │ ───────► │ CANCELLED │             │ VOTING  │ ─┘
-└──────┘          └───────────┘             └─────────┘
-    │                                            │
-    │              startVote                     │ vote passes
-    └──────────────────────────────────────────► │
-                                                 ▼
-                                            ┌─────────┐
-                                            │ CLOSED  │
-                                            └─────────┘
+                    ┌───────────────────────────┐
+                    │ vote fails                │
+                    │                           │
+                    ▼         startVote         │
+                ┌──────┐ ─────────────────► ┌─────────┐
+                │ OPEN │                    │ VOTING  │
+                └──────┘                    └─────────┘
+                    │                           │
+                    │ cancel                    │ vote passes
+                    ▼                           ▼
+              ┌───────────┐               ┌─────────┐
+              │ CANCELLED │               │ CLOSED  │
+              └───────────┘               └─────────┘
 ```
 
 | State | Description |
