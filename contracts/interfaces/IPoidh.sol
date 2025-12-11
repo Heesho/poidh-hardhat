@@ -24,9 +24,8 @@ interface IPoidh {
 
     function initialize(address issuer, address treasury, string calldata metadataURI, bool joinable) external payable;
     function join() external payable;
-    function withdraw() external;
+    function withdraw(address account) external;
     function cancel() external;
-    function claimRefund() external;
     function submitClaim(string calldata name, string calldata proofURI) external;
     function startVote(uint256 claimId) external;
     function vote(bool support) external;

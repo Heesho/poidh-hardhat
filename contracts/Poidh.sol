@@ -17,67 +17,70 @@ contract Poidh is Initializable, ReentrancyGuard {
                                 TYPES
     //////////////////////////////////////////////////////////////*/
 
-    enum State { OPEN, VOTING, CLOSED, CANCELLED }
+    enum State {
+        OPEN,       // accepting funds and claims, withdrawals allowed
+        VOTING,     // funds locked, contributors voting on claim
+        CLOSED,     // vote passed, funds paid out
+        CANCELLED   // issuer cancelled, contributors can claim refunds
+    }
 
     struct Claim {
-        address claimant;
-        string name;      // short name/title for UI display
-        string proofURI;  // IPFS hash pointing to full work/proof
+        address claimant;   // address that submitted the claim
+        string name;        // short name/title for UI display
+        string proofURI;    // IPFS hash pointing to full work/proof
     }
 
     struct VoteConfig {
-        uint256 claimId;
-        uint256 yes;
-        uint256 no;
-        uint256 deadline;
-        uint256 votingRound;
+        uint256 claimId;      // index of claim being voted on
+        uint256 yes;          // total weight of yes votes
+        uint256 no;           // total weight of no votes
+        uint256 deadline;     // timestamp when voting ends
+        uint256 votingRound;  // increments on failed vote, resets hasVoted
     }
 
     /*//////////////////////////////////////////////////////////////
                                 CONSTANTS
     //////////////////////////////////////////////////////////////*/
 
-    uint256 public constant TREASURY_FEE = 25;       // 2.5% (25/1000)
-    uint256 public constant VOTING_PERIOD = 2 days;
+    uint256 public constant TREASURY_FEE = 25;       // 2.5% fee (25/1000)
+    uint256 public constant VOTING_PERIOD = 2 days;  // duration of voting period
 
     /*//////////////////////////////////////////////////////////////
                                 STATE
     //////////////////////////////////////////////////////////////*/
 
-    address public issuer;
-    address public treasury;
-    string public metadataURI;  // IPFS hash containing title, description, requirements
-    State public state;
-    bool public joinable;  // true = open bounty (others can join), false = solo bounty
+    address public issuer;      // bounty creator, can start votes and cancel
+    address public treasury;    // protocol fee recipient
+    string public metadataURI;  // IPFS hash of bounty details (title, description, etc)
+    State public state;         // current bounty state
+    bool public joinable;       // true = open bounty, false = solo bounty
 
-    mapping(address => uint256) public account_Stake;  // account => ETH stake
-    uint256 public totalStaked;
+    mapping(address => uint256) public account_Stake;  // contributor => ETH staked
+    uint256 public totalStaked;                        // total ETH in bounty pool
 
-    Claim[] public claims;
-    VoteConfig public currentVote;
+    Claim[] public claims;          // all submitted claims
+    VoteConfig public currentVote;  // active voting configuration
 
-    mapping(address => mapping(uint256 => bool)) public account_Round_HasVoted;  // account => round => voted
+    mapping(address => mapping(uint256 => bool)) public account_Round_HasVoted;  // contributor => round => has voted
 
     /*//////////////////////////////////////////////////////////////
                                 ERRORS
     //////////////////////////////////////////////////////////////*/
 
     error Poidh__BountyNotOpen();
-    error Poidh__BountyNotCancelled();
     error Poidh__BountyNotJoinable();
     error Poidh__NoEthSent();
-    error Poidh__LockedDuringVoting();
+    error Poidh__CannotWithdraw();
     error Poidh__NoFundsToWithdraw();
     error Poidh__TransferFailed();
     error Poidh__OnlyIssuer();
-    error Poidh__IssuerCannotWithdraw();
     error Poidh__InvalidClaimId();
     error Poidh__VotingNotActive();
     error Poidh__VotingEnded();
     error Poidh__VotingNotEnded();
     error Poidh__AlreadyVotedThisRound();
     error Poidh__NoStakeInBounty();
-    error Poidh__DeadlineNotReached();
+    error Poidh__IssuerCannotVote();
 
     /*//////////////////////////////////////////////////////////////
                                 EVENTS
@@ -91,7 +94,6 @@ contract Poidh is Initializable, ReentrancyGuard {
     event Poidh__BountyPaid(address indexed winner, uint256 reward, uint256 fee);
     event Poidh__VoteFailed(uint256 indexed claimId, uint256 round);
     event Poidh__Cancelled();
-    event Poidh__RefundClaimed(address indexed user, uint256 amount);
 
     /*//////////////////////////////////////////////////////////////
                               INITIALIZER
@@ -139,21 +141,34 @@ contract Poidh is Initializable, ReentrancyGuard {
         emit Poidh__Joined(msg.sender, msg.value);
     }
 
-    /// @notice Withdraw your stake from the bounty (only when OPEN, issuer cannot withdraw)
-    function withdraw() external nonReentrant {
-        if (state != State.OPEN) revert Poidh__LockedDuringVoting();
-        if (msg.sender == issuer) revert Poidh__IssuerCannotWithdraw();
+    /// @notice Withdraw stake from the bounty
+    /// @dev OPEN: only non-issuer can withdraw their own stake
+    /// @dev CANCELLED: anyone can withdraw for any funder (enables automated refunds)
+    /// @param _account Address to withdraw funds for (only used when CANCELLED)
+    function withdraw(address _account) external nonReentrant {
+        address account;
 
-        uint256 amount = account_Stake[msg.sender];
+        if (state == State.CANCELLED) {
+            // Anyone can trigger withdrawal for any funder
+            account = _account;
+        } else if (state == State.OPEN) {
+            // Only the funder themselves can withdraw, issuer cannot
+            if (msg.sender == issuer) revert Poidh__CannotWithdraw();
+            account = msg.sender;
+        } else {
+            revert Poidh__CannotWithdraw();
+        }
+
+        uint256 amount = account_Stake[account];
         if (amount == 0) revert Poidh__NoFundsToWithdraw();
 
-        account_Stake[msg.sender] = 0;
+        account_Stake[account] = 0;
         totalStaked -= amount;
 
-        (bool success, ) = payable(msg.sender).call{value: amount}("");
+        (bool success, ) = payable(account).call{value: amount}("");
         if (!success) revert Poidh__TransferFailed();
 
-        emit Poidh__Withdrawn(msg.sender, amount);
+        emit Poidh__Withdrawn(account, amount);
     }
 
     /// @notice Issuer cancels the bounty (only when OPEN)
@@ -165,26 +180,11 @@ contract Poidh is Initializable, ReentrancyGuard {
         emit Poidh__Cancelled();
     }
 
-    /// @notice Claim refund after bounty is cancelled
-    function claimRefund() external nonReentrant {
-        if (state != State.CANCELLED) revert Poidh__BountyNotCancelled();
-
-        uint256 amount = account_Stake[msg.sender];
-        if (amount == 0) revert Poidh__NoFundsToWithdraw();
-
-        account_Stake[msg.sender] = 0;
-        totalStaked -= amount;
-
-        (bool success, ) = payable(msg.sender).call{value: amount}("");
-        if (!success) revert Poidh__TransferFailed();
-
-        emit Poidh__RefundClaimed(msg.sender, amount);
-    }
-
     /// @notice Submit work/proof for the bounty
     /// @param _name Short title for the claim (e.g., "PR #123")
     /// @param _proofURI IPFS hash containing detailed proof
     function submitClaim(string calldata _name, string calldata _proofURI) external {
+        if (state != State.OPEN) revert Poidh__BountyNotOpen();
         claims.push(Claim({
             claimant: msg.sender,
             name: _name,
@@ -211,9 +211,11 @@ contract Poidh is Initializable, ReentrancyGuard {
     }
 
     /// @notice Cast vote on the current claim (weight = stake)
+    /// @dev Issuer cannot vote to prevent conflict of interest
     /// @param support true = Yes, false = No
     function vote(bool support) external {
         if (state != State.VOTING) revert Poidh__VotingNotActive();
+        if (msg.sender == issuer) revert Poidh__IssuerCannotVote();
         if (block.timestamp >= currentVote.deadline) revert Poidh__VotingEnded();
 
         uint256 round = currentVote.votingRound;
@@ -262,13 +264,23 @@ contract Poidh is Initializable, ReentrancyGuard {
         Claim memory winningClaim = claims[currentVote.claimId];
 
         uint256 amount = totalStaked;
-        uint256 fee = (amount * TREASURY_FEE) / 1000;
-        uint256 reward = amount - fee;
+        uint256 fee;
+        uint256 reward;
+
+        if (treasury != address(0)) {
+            fee = (amount * TREASURY_FEE) / 1000;
+            reward = amount - fee;
+        } else {
+            fee = 0;
+            reward = amount;
+        }
 
         totalStaked = 0;
 
-        (bool tSuccess, ) = treasury.call{value: fee}("");
-        if (!tSuccess) revert Poidh__TransferFailed();
+        if (fee > 0) {
+            (bool tSuccess, ) = treasury.call{value: fee}("");
+            if (!tSuccess) revert Poidh__TransferFailed();
+        }
 
         (bool wSuccess, ) = winningClaim.claimant.call{value: reward}("");
         if (!wSuccess) revert Poidh__TransferFailed();

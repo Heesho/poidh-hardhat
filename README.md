@@ -50,7 +50,7 @@ Poidh allows users to create bounties for tasks or requests. Workers submit clai
 
 ### Solo Bounty
 
-Created with `createSoloBounty()`. Only the issuer funds the bounty.
+Created with `createBounty(metadataURI, false)`. Only the issuer funds the bounty.
 
 - `joinable = false` - others cannot add funds
 - Issuer has full control over claim acceptance
@@ -58,7 +58,7 @@ Created with `createSoloBounty()`. Only the issuer funds the bounty.
 
 ### Open Bounty
 
-Created with `createOpenBounty()`. Multiple users can contribute funds.
+Created with `createBounty(metadataURI, true)`. Multiple users can contribute funds.
 
 - `joinable = true` - anyone can call `join()` to add funds
 - Contributors vote on claim acceptance (weighted by stake)
@@ -70,12 +70,12 @@ Created with `createOpenBounty()`. Multiple users can contribute funds.
 
 **Solo Bounty:**
 ```solidity
-factory.createSoloBounty{value: 1 ether}("ipfs://QmMetadata...");
+factory.createBounty{value: 1 ether}("ipfs://QmMetadata...", false);
 ```
 
 **Open Bounty:**
 ```solidity
-factory.createOpenBounty{value: 1 ether}("ipfs://QmMetadata...");
+factory.createBounty{value: 1 ether}("ipfs://QmMetadata...", true);
 ```
 
 The `msg.value` becomes the issuer's initial stake.
@@ -101,6 +101,7 @@ bounty.submitClaim("PR #405 - Fix Header", "ipfs://QmProof...");
 ```
 
 - Anyone can submit claims
+- **Claims can only be submitted while bounty is in OPEN state**
 - Claims stored on-chain with claimant address, name, and proof URI
 - Multiple claims allowed per bounty
 
@@ -126,6 +127,7 @@ bounty.vote(true);  // yes
 bounty.vote(false); // no
 ```
 
+- **Issuer cannot vote** - the bounty issuer is excluded from voting to prevent conflict of interest
 - Vote weight = contributor's stake (1 wei = 1 vote)
 - Each address can only vote once per voting round
 - Voting tracked per round (allows re-voting if vote fails and resets)
@@ -146,17 +148,27 @@ bounty.resolveVote();
 - `yes >= no` → Claim accepted, funds paid out, state → `CLOSED`
 - `yes < no` → Vote failed, state → `OPEN`, voting round increments
 
-### 7. Withdrawing (Open Bounties)
+### 7. Withdrawing
 
-Non-issuer contributors can withdraw while `OPEN`:
+The `withdraw(address _account)` function has two modes depending on state:
 
+**While OPEN:**
 ```solidity
-bounty.withdraw();
+bounty.withdraw(msg.sender);  // _account param ignored, uses msg.sender
 ```
 
-- Only while state is `OPEN` (not during voting)
+- Only non-issuers can withdraw their own stake
 - Issuer cannot withdraw (must cancel instead)
-- Returns full stake to contributor
+- Returns full stake to the caller
+
+**While CANCELLED:**
+```solidity
+bounty.withdraw(anyAddress);  // Anyone can trigger withdrawal for any funder
+```
+
+- Anyone can call to refund any funder (enables automated batch refunds)
+- Funds are sent to the specified `_account`, not the caller
+- Useful for automating refund distribution after cancellation
 
 ### 8. Cancelling a Bounty
 
@@ -169,17 +181,7 @@ bounty.cancel();
 - Only issuer can call
 - Only while state is `OPEN`
 - Sets state to `CANCELLED`
-
-### 9. Claiming Refunds
-
-After cancellation, each contributor claims their refund:
-
-```solidity
-bounty.claimRefund();
-```
-
-- Only while state is `CANCELLED`
-- Returns contributor's full stake
+- After cancellation, anyone can call `withdraw(address)` to refund any funder
 
 ## Voting Logic
 
@@ -203,12 +205,9 @@ If a vote fails, the bounty returns to `OPEN` state and the voting round increme
 
 ### Early Resolution
 
-No need to wait 2 days if everyone has voted. When `yes + no == totalStaked`, resolution is immediate.
+No need to wait 2 days if all eligible voters have voted. Note that since the issuer cannot vote, early resolution requires all non-issuer contributors to vote.
 
-**Solo bounty fast path:**
-1. Issuer calls `startVote(claimId)`
-2. Issuer calls `vote(true)`
-3. Issuer calls `resolveVote()` → instant payout
+**Note:** For solo bounties (no other contributors), the vote will pass after the 2-day deadline since 0 >= 0 is true.
 
 ## Fees
 
@@ -217,7 +216,33 @@ No need to wait 2 days if everyone has voted. When `yes + no == totalStaked`, re
 | Treasury Fee | 2.5% | Protocol treasury |
 | Winner Reward | 97.5% | Claim winner |
 
-Fees deducted from total pool at payout.
+Fees deducted from total pool at payout. If treasury address is set to zero, the full amount goes to the winner (no fee collected).
+
+## Factory Administration
+
+The `PoidhFactory` contract is `Ownable`, allowing the owner to:
+
+### Set Implementation
+```solidity
+factory.setImplementation(newImplementationAddress);
+```
+- Updates the implementation contract used for new bounties
+- Existing bounties are unaffected (they keep their original implementation)
+- Cannot be set to zero address
+
+### Set Treasury
+```solidity
+factory.setTreasury(newTreasuryAddress);
+```
+- Updates the treasury address for new bounties
+- Existing bounties are unaffected (they keep their original treasury)
+- Can be set to zero address to disable fees for new bounties
+
+### Ownership Transfer
+```solidity
+factory.transferOwnership(newOwner);
+factory.renounceOwnership(); // Permanently removes owner
+```
 
 ## Data Schemas (IPFS)
 
@@ -260,16 +285,34 @@ Fees deducted from total pool at payout.
 |----------|------|-------------|
 | `implementation` | `address` | Master Poidh logic contract |
 | `treasury` | `address` | Protocol fee recipient |
+| `owner` | `address` | Factory owner (can update implementation/treasury) |
 | `allBounties` | `address[]` | Registry of all bounties |
 
 #### Functions
 
 | Function | Description |
 |----------|-------------|
-| `createSoloBounty(metadataURI)` | Deploy solo bounty (not joinable) |
-| `createOpenBounty(metadataURI)` | Deploy open bounty (joinable) |
+| `createBounty(metadataURI, joinable)` | Deploy bounty (joinable=false for solo, true for open) |
 | `getBountiesCount()` | Total bounties created |
 | `getBounties(limit, offset)` | Paginated bounty list |
+| `setImplementation(address)` | Update implementation (owner only) |
+| `setTreasury(address)` | Update treasury (owner only) |
+| `transferOwnership(address)` | Transfer ownership (owner only) |
+| `renounceOwnership()` | Renounce ownership permanently (owner only) |
+
+#### Events
+
+| Event | Description |
+|-------|-------------|
+| `PoidhFactory__BountyCreated` | New bounty deployed |
+| `PoidhFactory__ImplementationUpdated` | Implementation changed |
+| `PoidhFactory__TreasuryUpdated` | Treasury changed |
+
+#### Errors
+
+| Error | Cause |
+|-------|-------|
+| `PoidhFactory__ZeroAddress` | Setting implementation to zero address |
 
 ### Poidh
 
@@ -301,12 +344,11 @@ Fees deducted from total pool at payout.
 |----------|-------------|
 | `initialize(...)` | Initialize clone (called by factory) |
 | `join()` | Add ETH to bounty (open bounties only) |
-| `withdraw()` | Withdraw stake (non-issuers, while OPEN) |
+| `withdraw(account)` | Withdraw stake (OPEN: self only, CANCELLED: anyone for anyone) |
 | `cancel()` | Cancel bounty (issuer only, while OPEN) |
-| `claimRefund()` | Claim refund (after cancellation) |
-| `submitClaim(name, proofURI)` | Submit work proof |
+| `submitClaim(name, proofURI)` | Submit work proof (OPEN state only) |
 | `startVote(claimId)` | Start vote on claim (issuer only) |
-| `vote(support)` | Cast vote (true=yes, false=no) |
+| `vote(support)` | Cast vote (true=yes, false=no, issuer excluded) |
 | `resolveVote()` | Resolve vote after deadline/all votes |
 | `getClaimsCount()` | Number of claims |
 | `getClaim(claimId)` | Get claim details |
@@ -316,34 +358,32 @@ Fees deducted from total pool at payout.
 | Event | Description |
 |-------|-------------|
 | `Poidh__Joined` | User added funds |
-| `Poidh__Withdrawn` | User withdrew funds |
+| `Poidh__Withdrawn` | User withdrew funds (or was refunded) |
 | `Poidh__ClaimSubmitted` | New claim submitted |
 | `Poidh__VoteStarted` | Voting began |
 | `Poidh__VoteCast` | Vote recorded |
 | `Poidh__BountyPaid` | Bounty paid out |
 | `Poidh__VoteFailed` | Vote did not pass |
 | `Poidh__Cancelled` | Bounty cancelled |
-| `Poidh__RefundClaimed` | Refund claimed |
 
 #### Errors
 
 | Error | Cause |
 |-------|-------|
 | `Poidh__BountyNotOpen` | Action requires OPEN state |
-| `Poidh__BountyNotCancelled` | Refund requires CANCELLED state |
 | `Poidh__BountyNotJoinable` | Joining solo bounty |
 | `Poidh__NoEthSent` | Zero value transaction |
-| `Poidh__LockedDuringVoting` | Withdraw during VOTING |
+| `Poidh__CannotWithdraw` | Withdraw blocked (issuer in OPEN, or wrong state) |
 | `Poidh__NoFundsToWithdraw` | No stake to withdraw |
 | `Poidh__TransferFailed` | ETH transfer failed |
 | `Poidh__OnlyIssuer` | Non-issuer calling issuer function |
-| `Poidh__IssuerCannotWithdraw` | Issuer must cancel, not withdraw |
 | `Poidh__InvalidClaimId` | Claim does not exist |
 | `Poidh__VotingNotActive` | Action requires VOTING state |
 | `Poidh__VotingEnded` | Voting past deadline |
 | `Poidh__VotingNotEnded` | Resolving before deadline/all votes |
 | `Poidh__AlreadyVotedThisRound` | Double voting attempt |
 | `Poidh__NoStakeInBounty` | Voting without stake |
+| `Poidh__IssuerCannotVote` | Issuer attempting to vote |
 
 ## Development
 

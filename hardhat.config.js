@@ -1,7 +1,8 @@
 const { config } = require("dotenv");
 
-require("@nomiclabs/hardhat-waffle");
+require("@nomiclabs/hardhat-ethers");
 require("@nomicfoundation/hardhat-verify");
+require("@nomicfoundation/hardhat-chai-matchers");
 require("solidity-coverage");
 
 const CHAIN_ID = 8453; // base chain id
